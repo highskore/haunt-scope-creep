@@ -20,6 +20,12 @@ const PROSE: [&str; 12] = ["and/or", "either/or", "input/output", "read/write", 
 /// Files named without an extension.
 const BARE: [&str; 6] = ["Makefile", "Dockerfile", "Gemfile", "Pipfile", "Procfile", "LICENSE"];
 
+/// Extensions that make a `CODE`-rooted name a file after all.
+const EXTS: [&str; 25] = [
+    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "swift", "md", "json", "log", "go", "rb", "toml", "yaml", "yml", "txt", "sh", "example",
+    "lock", "css", "html", "c", "h",
+];
+
 /// `module.exports`, `process.env`: code a plan backticks, read as a name with an extension otherwise.
 const CODE: [&str; 14] = ["module", "process", "console", "window", "document", "globalThis", "this", "self", "os", "sys", "std", "Math", "JSON", "Object"];
 
@@ -87,7 +93,9 @@ fn named(word: &str, cwd: &str, code: bool, lone: bool) -> Option<Named> {
         return None;
     }
     let last = path.rsplit('/').next().unwrap_or(path);
-    if !path.contains('/') && path.split_once('.').is_some_and(|(root, _)| CODE.contains(&root)) {
+    // `module.exports` is code; `module.rs` and `process.env.example` are files.
+    let ext = path.rsplit_once('.').map(|(_, e)| e);
+    if !path.contains('/') && path.split_once('.').is_some_and(|(root, _)| CODE.contains(&root)) && !ext.is_some_and(|e| EXTS.contains(&e)) {
         return None;
     }
     let file = has_extension(last) || BARE.contains(&last);
@@ -100,11 +108,13 @@ fn named(word: &str, cwd: &str, code: bool, lone: bool) -> Option<Named> {
     }
 }
 
-/// A capital, then letters and digits with at least one lowercase: how extensionless files are named.
+/// How extensionless files are named: a capital, then letters and digits with a lowercase one
+/// (`Justfile`), or capitals and digits, four or more (`README`, `CODEOWNERS`).
 fn file_like(name: &str) -> bool {
+    let lower = name.chars().any(|c| c.is_ascii_lowercase());
     name.starts_with(|c: char| c.is_ascii_uppercase())
         && name.chars().all(|c| c.is_ascii_alphanumeric())
-        && name.chars().any(|c| c.is_ascii_lowercase())
+        && (lower || name.len() >= 4)
 }
 
 /// `main.rs`, `.env`, `Cargo.toml`; not `e.g`, `1.2` or `v2`.
@@ -468,6 +478,23 @@ middleware in src/middleware/session.ts, e.g. by retrying once.\n\
     #[test]
     fn a_lone_backticked_word_or_a_known_file_is_named() {
         assert_eq!(paths(&extract("Edit `Justfile`, docker/Dockerfile and LICENSE, not `make all` or Justfile", "/w")), ["Justfile", "docker/Dockerfile", "LICENSE"]);
+    }
+
+    #[test]
+    fn files_named_like_code_roots_are_files_and_code_is_not() {
+        let files = ["module.rs", "process.py", "console.ts", "Math.swift", "window.ts", "document.md", "Object.swift", "JSON.md", "console.log", "process.env.example"];
+        for f in files {
+            assert_eq!(paths(&extract(&format!("Edit `{f}`."), "/w")), [f], "{f}");
+        }
+        for c in ["module.exports", "process.env.PORT", "Math.max", "JSON.parse", "os.path.join", "process.env.RATE_MS"] {
+            assert!(extract(&format!("Use `{c}`."), "/w").is_empty(), "{c}");
+        }
+        for f in ["README", "CODEOWNERS", "NOTICE", "VERSION", "AUTHORS"] {
+            assert_eq!(paths(&extract(&format!("Update `{f}`."), "/w")), [f], "{f}");
+        }
+        for c in ["RATE_MS", "API", "1000", "createServer", "limiter"] {
+            assert!(extract(&format!("Set `{c}`."), "/w").is_empty(), "{c}");
+        }
     }
 
     #[test]
