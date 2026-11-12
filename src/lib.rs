@@ -46,7 +46,8 @@ const SCOPES: usize = 64;
 const PLANLESS: usize = 32;
 /// Touches across all scopes.
 const TOUCHES: usize = 4096;
-/// Bytes of plan and task paths across all scopes: four plans of `scope::MAX` long paths.
+/// Bytes of plan and task paths across all scopes; one scope holds at most `scope::PLAN_PATHS` +
+/// `scope::TASK_PATHS` of it.
 const PLAN_BYTES: usize = 64 * 1024;
 /// Rows per panel list, well under Haunt's 512 nodes.
 const ROWS: usize = 200;
@@ -73,18 +74,25 @@ impl Book {
     }
 
     /// Drops scopes until all fit, never `keep` (the one just changed): ones without a plan first,
-    /// then ones no tab shows, then the rest, oldest first. Returns the tabs that lost theirs.
+    /// then ones no tab shows, then the rest, oldest first. A tab's scope, and its session's own plan
+    /// when a subagent's is shown, only ever go for the count: one tab's flood can't push out another's.
     fn evict(&mut self, keep: &Key) -> Vec<String> {
         loop {
             let planless = self.scopes.values().filter(|(_, s)| s.plan.is_empty()).count();
             let touches: usize = self.scopes.values().map(|(_, s)| s.touched.len()).sum();
             let bytes: usize = self.scopes.values().map(|(_, s)| s.bytes).sum();
-            if self.scopes.len() <= SCOPES && planless <= PLANLESS && touches <= TOUCHES && bytes <= PLAN_BYTES {
+            let count = self.scopes.len() > SCOPES || planless > PLANLESS;
+            if !count && touches <= TOUCHES && bytes <= PLAN_BYTES {
                 break;
             }
-            let shown: Vec<&Key> = self.tabs.values().collect();
-            let rank = |k: &Key, s: &Scope| (!s.plan.is_empty(), shown.contains(&k));
-            let Some(victim) = self.scopes.iter().filter(|(k, _)| *k != keep).min_by_key(|(k, (at, s))| (rank(k, s), *at)).map(|(k, _)| k.clone()) else {
+            let shown = |k: &Key| self.tabs.values().any(|t| t == k || (t.0 == k.0 && k.1.is_none()));
+            let Some(victim) = self
+                .scopes
+                .iter()
+                .filter(|(k, _)| *k != keep && (count || !shown(k)))
+                .min_by_key(|(k, (at, s))| ((!s.plan.is_empty(), shown(k)), *at))
+                .map(|(k, _)| k.clone())
+            else {
                 break;
             };
             self.scopes.remove(&victim);
@@ -425,6 +433,36 @@ mod tests {
         assert!(b.scopes.values().map(|(_, s)| s.touched.len()).sum::<usize>() <= TOUCHES);
         assert_eq!(apply(&mut b, &at("file_edited", "sa", None, "a", None, Some("/w/shop/c.rs"))), ["a"]);
         assert_eq!(b.get("a").unwrap().row().unwrap().0, "1 outside plan");
+    }
+
+    #[test]
+    fn one_tabs_big_plan_and_tasks_cant_push_out_another_tabs_plan() {
+        let mut b = Book::default();
+        apply(&mut b, &at("plan_exit", "sa", None, "a", Some("Fix `src/a.rs`"), None));
+        let path = |i: usize| format!("`src/{}{i}.rs` ", "p".repeat(225));
+        let big: String = (0..250).map(path).collect();
+        assert!(big.len() > 59_000);
+        apply(&mut b, &at("plan_exit", "sb", None, "b", Some(&big), None));
+        for i in 0..70 {
+            let subject: String = (0..4).map(|j| path(1000 + i * 4 + j)).collect();
+            apply(&mut b, &at("task_created", "sb", None, "b", Some(&subject), None));
+        }
+        assert_eq!(apply(&mut b, &at("file_edited", "sa", None, "a", None, Some("/w/shop/c.rs"))), ["a"]);
+        assert_eq!(b.get("a").unwrap().row().unwrap().0, "1 outside plan");
+    }
+
+    #[test]
+    fn a_shown_subagent_keeps_its_sessions_plan() {
+        let mut b = Book::default();
+        apply(&mut b, &at("plan_exit", "sa", None, "a", Some("Fix `src/a.rs`"), None));
+        apply(&mut b, &at("plan_exit", "sa", Some("sub"), "a", Some("Fix `src/b.rs`"), None));
+        let path = |i: usize| format!("`src/{}{i}.rs` ", "p".repeat(220));
+        for k in 0..8 {
+            let plan: String = (0..70).map(|i| path(k * 100 + i)).collect();
+            apply(&mut b, &at("plan_exit", "sb", Some(&format!("s{k}")), "b", Some(&plan), None));
+        }
+        assert!(b.scopes.contains_key(&("sa".to_owned(), None)), "tab a shows its subagent, and its session's plan stays");
+        assert!(b.scopes.values().map(|(_, s)| s.bytes).sum::<usize>() <= PLAN_BYTES + scope::PLAN_PATHS);
     }
 
     #[test]

@@ -26,6 +26,11 @@ const CODE: [&str; 14] = ["module", "process", "console", "window", "document", 
 /// Bytes of one stored path; longer plan paths are skipped and longer touched ones cut.
 pub const PATH_MAX: usize = 256;
 
+/// Bytes of plan paths one scope keeps, and of task paths: a quarter and an eighth of the plugin's
+/// 64 KiB across all scopes, so one scope can't fill it alone.
+pub const PLAN_PATHS: usize = 16 * 1024;
+pub const TASK_PATHS: usize = 8 * 1024;
+
 /// The row suffix Haunt shows, in characters.
 const SUFFIX: usize = 64;
 
@@ -268,9 +273,16 @@ fn cut(s: &str) -> String {
     s[..s.floor_char_boundary(PATH_MAX)].to_owned()
 }
 
-/// Seen paths are kept as hashes, so a flood of long ones costs 8 bytes each.
-fn hash(path: &str) -> u64 {
-    BuildHasherDefault::<DefaultHasher>::default().hash_one(path)
+/// A path already touched: itself when short, else its hash, so a flood of long ones costs 8 bytes
+/// each and only those could ever collide.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Seen {
+    Path(String),
+    Hash(u64),
+}
+
+fn seen(path: &str) -> Seen {
+    if path.len() <= PATH_MAX { Seen::Path(path.into()) } else { Seen::Hash(BuildHasherDefault::<DefaultHasher>::default().hash_one(path)) }
 }
 
 /// One agent's plan and what it touched since.
@@ -284,7 +296,7 @@ pub struct Scope {
     rules: Vec<Rule>,
     /// Bytes of the paths in `plan` and `tasks`.
     pub bytes: usize,
-    seen: HashSet<u64>,
+    seen: HashSet<Seen>,
     pub touched: Vec<Touch>,
     pub inside_n: usize,
     pub outside_n: usize,
@@ -297,7 +309,14 @@ impl Scope {
     /// A new plan replaces the old one and starts the touches over.
     pub fn planned(&mut self, cwd: &str, plan: &str) {
         self.cwd = normal(cwd).unwrap_or_else(|| cwd.into());
-        self.plan = extract(plan, &self.cwd);
+        let mut used = 0;
+        self.plan = extract(plan, &self.cwd)
+            .into_iter()
+            .take_while(|n| {
+                used += n.path.len();
+                used <= PLAN_PATHS
+            })
+            .collect();
         self.seen.clear();
         self.touched.clear();
         (self.inside_n, self.outside_n, self.inside_full, self.outside_full) = (0, 0, false, false);
@@ -306,12 +325,18 @@ impl Scope {
 
     pub fn tasked(&mut self, cwd: &str, subject: &str) {
         let known: HashSet<Named> = self.tasks.iter().cloned().collect();
-        let new: Vec<Named> = extract(subject, cwd).into_iter().filter(|n| !known.contains(n)).collect();
-        if new.is_empty() || self.tasks.len() >= MAX {
-            return;
+        let mut used: usize = self.tasks.iter().map(|n| n.path.len()).sum();
+        let before = self.tasks.len();
+        for n in extract(subject, cwd).into_iter().filter(|n| !known.contains(n)) {
+            if self.tasks.len() >= MAX || used + n.path.len() > TASK_PATHS {
+                break;
+            }
+            used += n.path.len();
+            self.tasks.push(n);
         }
-        self.tasks.extend(new.into_iter().take(MAX - self.tasks.len()));
-        self.renamed();
+        if self.tasks.len() > before {
+            self.renamed();
+        }
     }
 
     fn renamed(&mut self) {
@@ -332,7 +357,7 @@ impl Scope {
             return false;
         }
         let path = normal(raw).unwrap_or_else(|| raw.into());
-        if self.seen.contains(&hash(&path)) {
+        if self.seen.contains(&seen(&path)) {
             return false;
         }
         let inside = inside(&path, &self.cwd, &self.rules);
@@ -345,7 +370,7 @@ impl Scope {
             Some(r) => (cut(r), true),
             None => (cut(&tilde(&path)), false),
         };
-        self.seen.insert(hash(&path));
+        self.seen.insert(seen(&path));
         self.touched.push(Touch { shown, local, inside });
         true
     }
@@ -591,6 +616,26 @@ Verification: `npm test` and `RATE_MS=500 node -e \"require('./src/server').crea
         let mut s = plan("`src/`");
         s.touch(&format!("/w/shop/{}", "𝕏".repeat(1000)));
         assert!(s.touched[0].shown.len() <= PATH_MAX && s.touched[0].shown.chars().all(|c| c == '𝕏'));
+    }
+
+    #[test]
+    fn one_scope_keeps_a_bounded_share_of_plan_and_task_paths() {
+        let long = |i: usize| format!("`src/{}{i}.rs` ", "p".repeat(220));
+        let mut s = plan(&(0..250).map(long).collect::<String>());
+        assert!(s.bytes <= PLAN_PATHS && s.plan.len() > 60, "{} paths, {} bytes", s.plan.len(), s.bytes);
+        for i in 0..100 {
+            s.tasked("/w/shop", &(0..4).map(|j| long(1000 + i * 4 + j)).collect::<String>());
+        }
+        let tasks: usize = s.tasks.iter().map(|n| n.path.len()).sum();
+        assert!(tasks <= TASK_PATHS && s.bytes <= PLAN_PATHS + TASK_PATHS);
+    }
+
+    #[test]
+    fn a_long_path_is_seen_once_too() {
+        let mut s = plan("`src/`");
+        let long = format!("/w/shop/src/{}.rs", "q".repeat(400));
+        assert!(s.touch(&long) && !s.touch(&long));
+        assert!(s.touch("/w/shop/a.rs") && !s.touch("/w/shop/./a.rs"));
     }
 
     #[test]
