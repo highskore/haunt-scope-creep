@@ -1,6 +1,19 @@
+<div align="center">
+
+<img src="docs/icon.png" width="96" alt="">
+
 # Scope creep
 
-Mark an agent's Haunt row when it edits files its own plan didn't name.
+**Mark an agent's Haunt row when it edits files its own plan didn't name.**
+
+[![Haunt plugin](https://img.shields.io/badge/Haunt-plugin-D97757)](https://github.com/highskore/haunt-hackathon)
+![Plugin API 0.5](https://img.shields.io/badge/plugin%20API-0.5-111)
+![WASM component](https://img.shields.io/badge/WASM-component-654ff0?logo=webassembly&logoColor=white)
+![MIT licence](https://img.shields.io/badge/licence-MIT-6b7280)
+
+<img src="docs/screenshot.png" width="720" alt="The suite row reads 1 outside plan · package.json, and the Scope panel lists the files the plan names next to the ones the agent touched, with package.json in orange">
+
+</div>
 
 When an agent leaves plan mode, this plugin reads the plan for the files and folders it names. From then on it compares every file the agent edits against that list. Once an edit falls outside, the row shows `2 outside plan` on the right and the files after the meta line (`package.json, .github/`). A row with no plan, or with every edit inside the plan, shows nothing.
 
