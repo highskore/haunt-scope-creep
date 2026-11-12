@@ -7,7 +7,7 @@ When an agent leaves plan mode, this plugin reads the plan for the files and fol
 ## What counts as named
 
 - Backticked names, Markdown link targets (`[notes](docs/auth.md)`), and words with a `/` or a file extension (`src/auth/refresh.ts`, `docs/`, `package.json`). Prose words are skipped.
-- `Makefile`, `Dockerfile`, `Gemfile`, `Pipfile`, `Procfile` and `LICENSE`, and any single backticked word (`` `Justfile` ``).
+- `Makefile`, `Dockerfile`, `Gemfile`, `Pipfile`, `Procfile` and `LICENSE`, and a single backticked word named like them (`` `Justfile` ``). Backticked code such as `` `RATE_MS` ``, `` `createServer` `` or `` `module.exports` `` is not a file.
 - Paths are read relative to the agent's folder, or a folder above it such as the repo root. An absolute path inside it counts. Windows paths, `../`, `~`, URLs and globs are skipped.
 - A plan counts its first 256 paths, and tasks add up to 256 more.
 - Paths in the subjects of the agent's tasks count too, for as long as the session runs.

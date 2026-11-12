@@ -20,6 +20,9 @@ const PROSE: [&str; 12] = ["and/or", "either/or", "input/output", "read/write", 
 /// Files named without an extension.
 const BARE: [&str; 6] = ["Makefile", "Dockerfile", "Gemfile", "Pipfile", "Procfile", "LICENSE"];
 
+/// `module.exports`, `process.env`: code a plan backticks, read as a name with an extension otherwise.
+const CODE: [&str; 14] = ["module", "process", "console", "window", "document", "globalThis", "this", "self", "os", "sys", "std", "Math", "JSON", "Object"];
+
 /// Bytes of one stored path; longer plan paths are skipped and longer touched ones cut.
 pub const PATH_MAX: usize = 256;
 
@@ -79,13 +82,24 @@ fn named(word: &str, cwd: &str, code: bool, lone: bool) -> Option<Named> {
         return None;
     }
     let last = path.rsplit('/').next().unwrap_or(path);
+    if !path.contains('/') && path.split_once('.').is_some_and(|(root, _)| CODE.contains(&root)) {
+        return None;
+    }
     let file = has_extension(last) || BARE.contains(&last);
     match (folder, path.contains('/'), file) {
         (true, _, _) => Some(Named { path: path.into(), folder: true }),
         (false, _, true) => Some(Named { path: path.into(), folder: false }),
         (false, true, false) => Some(Named { path: path.into(), folder: true }),
-        (false, false, false) => lone.then(|| Named { path: path.into(), folder: false }),
+        // `Justfile`, not `RATE_MS`, `createServer`, `limiter` or `1000`.
+        (false, false, false) => (lone && file_like(path)).then(|| Named { path: path.into(), folder: false }),
     }
+}
+
+/// A capital, then letters and digits with at least one lowercase: how extensionless files are named.
+fn file_like(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name.chars().all(|c| c.is_ascii_alphanumeric())
+        && name.chars().any(|c| c.is_ascii_lowercase())
 }
 
 /// `main.rs`, `.env`, `Cargo.toml`; not `e.g`, `1.2` or `v2`.
@@ -429,6 +443,16 @@ middleware in src/middleware/session.ts, e.g. by retrying once.\n\
     #[test]
     fn a_lone_backticked_word_or_a_known_file_is_named() {
         assert_eq!(paths(&extract("Edit `Justfile`, docker/Dockerfile and LICENSE, not `make all` or Justfile", "/w")), ["Justfile", "docker/Dockerfile", "LICENSE"]);
+    }
+
+    #[test]
+    fn backticked_code_in_a_real_plan_is_not_a_file() {
+        let plan = "# Plan: configurable rate limit via `RATE_MS`\n\
+The limiter in `src/server.js` is hardcoded (`limiter(1)` in `createServer`), default `1000`.\n\
+1. `src/server.js`: read `process.env.RATE_MS`; replace `limiter(1)` with `limiter(1000 / rateMs)`. `limiter` and `module.exports` are unchanged.\n\
+2. `README.md`: document `RATE_MS`.\n\
+Verification: `npm test` and `RATE_MS=500 node -e \"require('./src/server').createServer().listen(0)\"`.";
+        assert_eq!(paths(&extract(plan, "/w/suite")), ["src/server.js", "README.md"]);
     }
 
     #[test]
