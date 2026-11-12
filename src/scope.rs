@@ -1,6 +1,7 @@
 //! What a plan names, and whether a file an agent touched falls inside it. Free of host calls.
 
 use std::collections::HashSet;
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 
 /// A file or folder a plan names, as written there (relative to the repo or the agent's folder).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -18,6 +19,12 @@ const PROSE: [&str; 12] = ["and/or", "either/or", "input/output", "read/write", 
 
 /// Files named without an extension.
 const BARE: [&str; 6] = ["Makefile", "Dockerfile", "Gemfile", "Pipfile", "Procfile", "LICENSE"];
+
+/// Bytes of one stored path; longer plan paths are skipped and longer touched ones cut.
+pub const PATH_MAX: usize = 256;
+
+/// The row suffix Haunt shows, in characters.
+const SUFFIX: usize = 64;
 
 /// Folders above the agent's a plan's paths may be relative to (the repo root, usually one or two up).
 const UP: usize = 8;
@@ -65,7 +72,7 @@ fn named(word: &str, cwd: &str, code: bool, lone: bool) -> Option<Named> {
     };
     let folder = w.ends_with('/');
     let path = w.trim_end_matches('/');
-    if path.is_empty() || path.split('/').any(|s| s.is_empty() || s == "." || s == ".." || !s.chars().all(|c| c.is_alphanumeric() || "._-".contains(c))) {
+    if path.is_empty() || path.len() > PATH_MAX || path.split('/').any(|s| s.is_empty() || s == "." || s == ".." || !s.chars().all(|c| c.is_alphanumeric() || "._-".contains(c))) {
         return None;
     }
     if !code && PROSE.contains(&path.to_lowercase().as_str()) {
@@ -235,12 +242,21 @@ pub fn says_needs_you(text: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Touch {
-    /// Normalised when absolute.
-    pub path: String,
-    /// Relative to the agent's folder when under it, else the full path with `~` for home.
+    /// Relative to the agent's folder when under it, else the full path with `~` for home; at most
+    /// `PATH_MAX` bytes.
     pub shown: String,
     pub local: bool,
     pub inside: bool,
+}
+
+/// A fresh string, as `truncate` would keep the long one's allocation.
+fn cut(s: &str) -> String {
+    s[..s.floor_char_boundary(PATH_MAX)].to_owned()
+}
+
+/// Seen paths are kept as hashes, so a flood of long ones costs 8 bytes each.
+fn hash(path: &str) -> u64 {
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(path)
 }
 
 /// One agent's plan and what it touched since.
@@ -252,7 +268,9 @@ pub struct Scope {
     pub tasks: Vec<Named>,
     named: Vec<Named>,
     rules: Vec<Rule>,
-    seen: HashSet<String>,
+    /// Bytes of the paths in `plan` and `tasks`.
+    pub bytes: usize,
+    seen: HashSet<u64>,
     pub touched: Vec<Touch>,
     pub inside_n: usize,
     pub outside_n: usize,
@@ -286,6 +304,7 @@ impl Scope {
         let mut seen: HashSet<&Named> = HashSet::new();
         self.named = self.plan.iter().chain(&self.tasks).filter(|n| seen.insert(n)).cloned().collect();
         self.rules = rules(&self.named);
+        self.bytes = self.plan.iter().chain(&self.tasks).map(|n| n.path.len()).sum();
     }
 
     /// The plan's paths, then the tasks' it doesn't have.
@@ -299,7 +318,7 @@ impl Scope {
             return false;
         }
         let path = normal(raw).unwrap_or_else(|| raw.into());
-        if self.seen.contains(&path) {
+        if self.seen.contains(&hash(&path)) {
             return false;
         }
         let inside = inside(&path, &self.cwd, &self.rules);
@@ -308,13 +327,12 @@ impl Scope {
             return !std::mem::replace(full, true);
         }
         *n += 1;
-        let rel = rel_of(&path, &self.cwd).map(str::to_owned);
-        let (shown, local) = match rel {
-            Some(r) => (r, true),
-            None => (tilde(&path), false),
+        let (shown, local) = match rel_of(&path, &self.cwd) {
+            Some(r) => (cut(r), true),
+            None => (cut(&tilde(&path)), false),
         };
-        self.seen.insert(path.clone());
-        self.touched.push(Touch { path, shown, local, inside });
+        self.seen.insert(hash(&path));
+        self.touched.push(Touch { shown, local, inside });
         true
     }
 
@@ -331,21 +349,21 @@ impl Scope {
         let mut listed: HashSet<String> = HashSet::new();
         let mut suffix = String::new();
         for t in self.outside() {
-            // Haunt shows 64 characters.
-            if suffix.len() >= 64 {
-                break;
-            }
             let s = if t.local { short(&t.shown, &self.named) } else { t.shown.clone() };
             if !listed.insert(s.clone()) {
                 continue;
             }
-            for item in [s.as_str(), "1 file"] {
-                let next = if suffix.is_empty() { item.to_owned() } else { format!("{suffix}, {item}") };
-                if !says_needs_you(&next) {
-                    suffix = next;
-                    break;
-                }
+            let join = |item: &str| if suffix.is_empty() { item.to_owned() } else { format!("{suffix}, {item}") };
+            let mut next = join(&s);
+            // A name that reads as a status, or one too long for the row on its own.
+            if says_needs_you(&next) || s.chars().count() > SUFFIX {
+                next = join("1 file");
             }
+            // Whole items only, so Haunt's cut never lands mid-name.
+            if next.chars().count() > SUFFIX || says_needs_you(&next) {
+                break;
+            }
+            suffix = next;
         }
         Some((label, suffix))
     }
@@ -524,6 +542,31 @@ middleware in src/middleware/session.ts, e.g. by retrying once.\n\
         let (label, suffix) = s.row().unwrap();
         assert_eq!((label.as_str(), suffix.as_str()), ("4 outside plan", "1 file, a.rs, needs, 1 file"));
         assert!(!says_needs_you(&suffix));
+    }
+
+    #[test]
+    fn the_suffix_holds_whole_names_only() {
+        let mut s = plan("`src/`");
+        for p in ["aaaaaaaaaaaaaaaaaaaa.rs", "bbbbbbbbbbbbbbbbbbbb.rs", "cccccccccccccccccccc.rs", "d.rs"] {
+            s.touch(&format!("/w/shop/{p}"));
+        }
+        let long = "𝕏".repeat(70);
+        s.touch(&format!("/w/shop/{long}"));
+        let (_, suffix) = s.row().unwrap();
+        assert_eq!(suffix, "aaaaaaaaaaaaaaaaaaaa.rs, bbbbbbbbbbbbbbbbbbbb.rs");
+        let mut s = plan("`src/`");
+        s.touch(&format!("/w/shop/{long}"));
+        s.touch("/w/shop/e.rs");
+        assert_eq!(s.row().unwrap().1, "1 file, e.rs", "a name too long for the row");
+    }
+
+    #[test]
+    fn long_paths_are_cut_or_skipped() {
+        let long = "x".repeat(PATH_MAX);
+        assert!(extract(&format!("`src/{long}.rs`"), "/w").is_empty());
+        let mut s = plan("`src/`");
+        s.touch(&format!("/w/shop/{}", "𝕏".repeat(1000)));
+        assert!(s.touched[0].shown.len() <= PATH_MAX && s.touched[0].shown.chars().all(|c| c == '𝕏'));
     }
 
     #[test]

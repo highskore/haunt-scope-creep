@@ -39,8 +39,15 @@ impl Default for Settings {
 /// A session, or one of its subagents.
 type Key = (String, Option<String>);
 
-/// Scopes kept; the least recently active goes first.
+/// Scopes kept. Agent ids come from the agent, so one tab can make many: these bound the plugin's
+/// memory as a whole, well under Haunt's 64 MB.
 const SCOPES: usize = 64;
+/// Of them, scopes with tasks but no plan.
+const PLANLESS: usize = 32;
+/// Touches across all scopes.
+const TOUCHES: usize = 4096;
+/// Bytes of plan and task paths across all scopes: four plans of `scope::MAX` long paths.
+const PLAN_BYTES: usize = 64 * 1024;
 /// Rows per panel list, well under Haunt's 512 nodes.
 const ROWS: usize = 200;
 
@@ -65,11 +72,22 @@ impl Book {
         &mut e.1
     }
 
-    /// Drops the oldest scopes past `SCOPES`; returns the tabs that lost theirs.
-    fn evict(&mut self) -> Vec<String> {
-        while self.scopes.len() > SCOPES {
-            let Some(oldest) = self.scopes.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone()) else { break };
-            self.scopes.remove(&oldest);
+    /// Drops scopes until all fit, never `keep` (the one just changed): ones without a plan first,
+    /// then ones no tab shows, then the rest, oldest first. Returns the tabs that lost theirs.
+    fn evict(&mut self, keep: &Key) -> Vec<String> {
+        loop {
+            let planless = self.scopes.values().filter(|(_, s)| s.plan.is_empty()).count();
+            let touches: usize = self.scopes.values().map(|(_, s)| s.touched.len()).sum();
+            let bytes: usize = self.scopes.values().map(|(_, s)| s.bytes).sum();
+            if self.scopes.len() <= SCOPES && planless <= PLANLESS && touches <= TOUCHES && bytes <= PLAN_BYTES {
+                break;
+            }
+            let shown: Vec<&Key> = self.tabs.values().collect();
+            let rank = |k: &Key, s: &Scope| (!s.plan.is_empty(), shown.contains(&k));
+            let Some(victim) = self.scopes.iter().filter(|(k, _)| *k != keep).min_by_key(|(k, (at, s))| (rank(k, s), *at)).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            self.scopes.remove(&victim);
         }
         let gone: Vec<String> = self.tabs.iter().filter(|(_, k)| !self.scopes.contains_key(*k)).map(|(t, _)| t.clone()).collect();
         self.tabs.retain(|_, k| self.scopes.contains_key(k));
@@ -103,18 +121,19 @@ pub fn apply(b: &mut Book, e: &AgentEvent) -> Vec<String> {
         return Vec::new();
     }
     let own: Key = (session.clone(), e.agent_id.clone());
-    match (e.kind.as_str(), e.summary.as_deref()) {
+    let changed = match (e.kind.as_str(), e.summary.as_deref()) {
         ("plan_exit", Some(summary)) => {
             // The tab moved on to a new session: the old one's plans are done.
             if let Some(old) = b.tabs.get(surface).filter(|k| k.0 != session).map(|k| k.0.clone()) {
                 b.scopes.retain(|k, _| k.0 != old);
             }
             b.entry(own.clone()).planned(cwd, summary);
-            b.tabs.insert(surface.into(), own);
+            b.tabs.insert(surface.into(), own.clone());
+            own
         }
         ("task_created", Some(subject)) => {
-            b.entry(own).tasked(cwd, subject);
-            return b.evict();
+            b.entry(own.clone()).tasked(cwd, subject);
+            return b.evict(&own);
         }
         ("file_edited", _) if e.tool.as_deref().is_some_and(|t| EDITS.contains(&t)) => {
             let Some(path) = e.file_path.as_deref() else { return Vec::new() };
@@ -125,11 +144,12 @@ pub fn apply(b: &mut Book, e: &AgentEvent) -> Vec<String> {
             if !b.entry(key.clone()).touch(path) {
                 return Vec::new();
             }
-            b.tabs.insert(surface.into(), key);
+            b.tabs.insert(surface.into(), key.clone());
+            key
         }
         _ => return Vec::new(),
-    }
-    let mut out = b.evict();
+    };
+    let mut out = b.evict(&changed);
     out.push(surface.into());
     out
 }
@@ -352,6 +372,70 @@ mod tests {
         }
         assert_eq!((b.scopes.len(), b.tabs.len()), (SCOPES, SCOPES));
         assert!(b.get("t").is_none() && b.get(&format!("t{}", SCOPES + 4)).is_some(), "the oldest went");
+    }
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    /// Counts live heap bytes, so a test can bound the plugin's peak memory. Natively, so pointers
+    /// are twice wasm's and the bound is on the safe side.
+    struct Counting;
+    static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() {
+                PEAK.fetch_max(LIVE_BYTES.fetch_add(l.size(), Relaxed) + l.size(), Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) };
+            LIVE_BYTES.fetch_sub(l.size(), Relaxed);
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
+
+    fn at(kind: &str, session: &str, agent: Option<&str>, surface: &str, summary: Option<&str>, file: Option<&str>) -> AgentEvent {
+        let mut e = event(kind, agent, summary, file, true);
+        (e.session_id, e.surface) = (Some(session.into()), Some(surface.into()));
+        e
+    }
+
+    #[test]
+    fn a_flood_of_subagent_writes_stays_small_and_leaves_other_tabs_alone() {
+        let mut b = Book::default();
+        apply(&mut b, &at("plan_exit", "sa", None, "a", Some("Fix `src/a.rs`"), None));
+        let base = LIVE_BYTES.load(Relaxed);
+        PEAK.store(base, Relaxed);
+        let long = "𝕏".repeat(1000);
+        for i in 0..50 {
+            let agent = format!("sub{i}");
+            apply(&mut b, &at("plan_exit", "sb", Some(&agent), "b", Some("Only `src/b.rs`"), None));
+            for j in 0..512 {
+                apply(&mut b, &at("file_edited", "sb", Some(&agent), "b", None, Some(&format!("/w/shop/{long}{j}"))));
+            }
+        }
+        let peak = PEAK.load(Relaxed) - base;
+        assert!(peak < 4 << 20, "peak {peak} bytes, about 1.3 MB when written");
+        assert!(b.scopes.values().map(|(_, s)| s.touched.len()).sum::<usize>() <= TOUCHES);
+        assert_eq!(apply(&mut b, &at("file_edited", "sa", None, "a", None, Some("/w/shop/c.rs"))), ["a"]);
+        assert_eq!(b.get("a").unwrap().row().unwrap().0, "1 outside plan");
+    }
+
+    #[test]
+    fn task_only_scopes_go_before_a_plan() {
+        let mut b = Book::default();
+        apply(&mut b, &at("plan_exit", "sa", None, "a", Some("Fix `src/a.rs`"), None));
+        for i in 0..70 {
+            apply(&mut b, &at("task_created", "sb", Some(&format!("sub{i}")), "b", Some("Write `x.rs`"), None));
+        }
+        assert_eq!(b.scopes.values().filter(|(_, s)| s.plan.is_empty()).count(), PLANLESS);
+        assert!(b.get("a").is_some_and(|s| !s.plan.is_empty()), "tab a's plan stays");
     }
 
     #[test]
