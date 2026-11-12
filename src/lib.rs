@@ -39,12 +39,48 @@ impl Default for Settings {
 /// A session, or one of its subagents.
 type Key = (String, Option<String>);
 
+/// Scopes kept; the least recently active goes first.
+const SCOPES: usize = 64;
+/// Rows per panel list, well under Haunt's 512 nodes.
+const ROWS: usize = 200;
+
+#[derive(Default)]
+pub struct Book {
+    /// Each with when it was last active.
+    scopes: BTreeMap<Key, (u64, Scope)>,
+    /// Each tab's latest session with a plan.
+    tabs: BTreeMap<String, Key>,
+    seq: u64,
+}
+
+impl Book {
+    fn get(&self, surface: &str) -> Option<&Scope> {
+        self.tabs.get(surface).and_then(|k| self.scopes.get(k)).map(|(_, s)| s)
+    }
+
+    fn entry(&mut self, k: Key) -> &mut Scope {
+        self.seq += 1;
+        let e = self.scopes.entry(k).or_default();
+        e.0 = self.seq;
+        &mut e.1
+    }
+
+    /// Drops the oldest scopes past `SCOPES`; returns the tabs that lost theirs.
+    fn evict(&mut self) -> Vec<String> {
+        while self.scopes.len() > SCOPES {
+            let Some(oldest) = self.scopes.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone()) else { break };
+            self.scopes.remove(&oldest);
+        }
+        let gone: Vec<String> = self.tabs.iter().filter(|(_, k)| !self.scopes.contains_key(*k)).map(|(t, _)| t.clone()).collect();
+        self.tabs.retain(|_, k| self.scopes.contains_key(k));
+        gone
+    }
+}
+
 #[derive(Default)]
 struct Live {
     settings: Settings,
-    scopes: BTreeMap<Key, Scope>,
-    /// Each tab's latest session with a plan.
-    tabs: BTreeMap<String, Key>,
+    book: Book,
     /// The tab whose panel is open.
     open: Option<String>,
 }
@@ -60,34 +96,42 @@ fn name_of(cwd: &str) -> &str {
     cwd.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("agent")
 }
 
-/// What one event does to the scopes; returns the tab to redraw.
-pub fn apply(scopes: &mut BTreeMap<Key, Scope>, tabs: &mut BTreeMap<String, Key>, e: &AgentEvent) -> Option<String> {
+/// What one event does to the scopes; returns the tabs to redraw.
+pub fn apply(b: &mut Book, e: &AgentEvent) -> Vec<String> {
+    let (Some(surface), Some(session), Some(cwd)) = (e.surface.as_deref(), e.session_id.clone(), e.cwd.as_deref()) else { return Vec::new() };
     if !e.verified {
-        return None;
+        return Vec::new();
     }
-    let (surface, session, cwd) = (e.surface.as_deref()?, e.session_id.clone()?, e.cwd.as_deref()?);
     let own: Key = (session.clone(), e.agent_id.clone());
-    match e.kind.as_str() {
-        "plan_exit" => {
-            scopes.entry(own.clone()).or_default().planned(cwd, e.summary.as_deref()?);
-            tabs.insert(surface.into(), own);
-        }
-        "task_created" => {
-            scopes.entry(own).or_default().tasked(cwd, e.summary.as_deref()?);
-            return None;
-        }
-        "file_edited" if e.tool.as_deref().is_some_and(|t| EDITS.contains(&t)) => {
-            let path = e.file_path.as_deref()?;
-            // A subagent without a plan of its own works on its session's.
-            let key = [own, (session, None)].into_iter().find(|k| scopes.get(k).is_some_and(|s| !s.plan.is_empty()))?;
-            if !scopes.get_mut(&key)?.touch(path) {
-                return None;
+    match (e.kind.as_str(), e.summary.as_deref()) {
+        ("plan_exit", Some(summary)) => {
+            // The tab moved on to a new session: the old one's plans are done.
+            if let Some(old) = b.tabs.get(surface).filter(|k| k.0 != session).map(|k| k.0.clone()) {
+                b.scopes.retain(|k, _| k.0 != old);
             }
-            tabs.insert(surface.into(), key);
+            b.entry(own.clone()).planned(cwd, summary);
+            b.tabs.insert(surface.into(), own);
         }
-        _ => return None,
+        ("task_created", Some(subject)) => {
+            b.entry(own).tasked(cwd, subject);
+            return b.evict();
+        }
+        ("file_edited", _) if e.tool.as_deref().is_some_and(|t| EDITS.contains(&t)) => {
+            let Some(path) = e.file_path.as_deref() else { return Vec::new() };
+            // A subagent without a plan of its own works on its session's.
+            let Some(key) = [own, (session, None)].into_iter().find(|k| b.scopes.get(k).is_some_and(|(_, s)| !s.plan.is_empty())) else {
+                return Vec::new();
+            };
+            if !b.entry(key.clone()).touch(path) {
+                return Vec::new();
+            }
+            b.tabs.insert(surface.into(), key);
+        }
+        _ => return Vec::new(),
     }
-    Some(surface.into())
+    let mut out = b.evict();
+    out.push(surface.into());
+    out
 }
 
 fn decoration(s: &Scope) -> Option<Decoration> {
@@ -100,17 +144,30 @@ pub fn nodes(s: &Scope) -> Vec<PanelNode> {
     let node = |node| PanelNode { parent: None, node };
     let text = |text: &str| node(Node::Text(TextNode { text: text.into(), tone: PTone::Dim, mono: false, bold: true }));
     let row = |label: String, right: Option<&str>, tone| node(Node::Row(RowNode { label, sub: None, right: right.map(Into::into), tone }));
+    let more = |n: usize| row(format!("+{n} more"), None, PTone::Faint);
     let mut out = vec![text("The plan names")];
-    for n in s.named() {
-        out.push(row(if n.folder { format!("{}/", n.path) } else { n.path }, None, PTone::Text));
+    for n in s.named().iter().take(ROWS) {
+        out.push(row(if n.folder { format!("{}/", n.path) } else { n.path.clone() }, None, PTone::Text));
+    }
+    if s.named().len() > ROWS {
+        out.push(more(s.named().len() - ROWS));
     }
     out.push(node(Node::Divider));
     out.push(text("It touched"));
     if s.touched.is_empty() {
         out.push(row("nothing yet".into(), None, PTone::Faint));
     }
-    for t in &s.touched {
+    // Too many to list: the outside ones first, as they're what matters.
+    let mut touched: Vec<&scope::Touch> = s.touched.iter().collect();
+    if touched.len() > ROWS {
+        touched.sort_by_key(|t| t.inside);
+    }
+    for t in touched.iter().take(ROWS) {
         out.push(if t.inside { row(t.shown.clone(), None, PTone::Text) } else { row(t.shown.clone(), Some("outside plan"), PTone::Warn) });
+    }
+    let hidden = s.touched.len().saturating_sub(ROWS) + usize::from(s.inside_full) + usize::from(s.outside_full);
+    if hidden > 0 {
+        out.push(if s.inside_full || s.outside_full { row("more not counted".into(), None, PTone::Faint) } else { more(hidden) });
     }
     out
 }
@@ -122,11 +179,18 @@ fn show(s: &Scope) {
 }
 
 fn redraw(l: &Live, surface: &str) {
-    let s = l.tabs.get(surface).and_then(|k| l.scopes.get(k));
-    if l.settings.row
-        && let Err(e) = rows::decorate(surface, s.and_then(decoration).as_ref())
-    {
-        log(LogLevel::Debug, &format!("scope-creep: row not marked: {e}"));
+    let s = l.book.get(surface);
+    if l.settings.row {
+        let d = s.and_then(decoration);
+        if let Err(e) = rows::decorate(surface, d.as_ref()) {
+            log(LogLevel::Debug, &format!("scope-creep: row not marked: {e}"));
+            // The count alone, rather than a row stuck on an older one.
+            if let Some(d) = d.map(|d| Decoration { suffix: None, ..d })
+                && let Err(e) = rows::decorate(surface, Some(&d))
+            {
+                log(LogLevel::Debug, &format!("scope-creep: count not shown: {e}"));
+            }
+        }
     }
     if l.open.as_deref() == Some(surface)
         && let Some(s) = s
@@ -136,7 +200,7 @@ fn redraw(l: &Live, surface: &str) {
 }
 
 fn open(l: &mut Live, surface: &str) {
-    match l.tabs.get(surface).and_then(|k| l.scopes.get(k)) {
+    match l.book.get(surface) {
         Some(s) => {
             show(s);
             l.open = Some(surface.into());
@@ -160,7 +224,7 @@ impl Guest for Plugin {
                 rows::clear_all();
                 return;
             }
-            let tabs: Vec<String> = l.tabs.keys().cloned().collect();
+            let tabs: Vec<String> = l.book.tabs.keys().cloned().collect();
             for t in tabs {
                 redraw(l, &t);
             }
@@ -169,7 +233,7 @@ impl Guest for Plugin {
 
     fn on_event(event: AgentEvent) {
         with(|l| {
-            if let Some(surface) = apply(&mut l.scopes, &mut l.tabs, &event) {
+            for surface in apply(&mut l.book, &event) {
                 redraw(l, &surface);
             }
         });
@@ -181,13 +245,17 @@ impl Guest for Plugin {
         }
         let q = query.trim().to_lowercase();
         with(|l| {
-            l.tabs
-                .iter()
-                .filter_map(|(surface, k)| Some((surface, l.scopes.get(k)?)))
+            l.book
+                .tabs
+                .keys()
+                .filter_map(|surface| Some((surface, l.book.get(surface)?)))
                 .filter(|(_, s)| name_of(&s.cwd).to_lowercase().contains(&q))
                 .map(|(surface, s)| {
-                    let out = s.outside().count();
-                    let tail = if out > 0 { format!(" · {out} outside plan") } else { String::new() };
+                    let tail = match (s.outside_n, s.outside_full) {
+                        (0, _) => String::new(),
+                        (_, true) => format!(" · {}+ outside plan", scope::MAX),
+                        (n, false) => format!(" · {n} outside plan"),
+                    };
                     let sub = format!("{} named · {} touched{tail}", s.named().len(), s.touched.len());
                     PaletteItem { id: format!("open:{surface}"), title: name_of(&s.cwd).into(), subtitle: Some(sub), at_ms: None, mark: None, surface: None }
                 })
@@ -208,7 +276,7 @@ impl Guest for Plugin {
     }
 
     fn row_menu(surface: String) -> Vec<MenuItem> {
-        let planned = with(|l| l.tabs.contains_key(&surface));
+        let planned = with(|l| l.book.get(&surface).is_some());
         planned.then(|| MenuItem { id: "scope".into(), title: "Scope".into(), checked: false, parent: None }).into_iter().collect()
     }
 
@@ -252,17 +320,54 @@ mod tests {
 
     #[test]
     fn verified_plans_and_edits_mark_the_row() {
-        let (mut scopes, mut tabs) = (BTreeMap::new(), BTreeMap::new());
-        let mut go = |e: AgentEvent| apply(&mut scopes, &mut tabs, &e);
-        assert_eq!(go(event("file_edited", None, None, Some("/w/shop/x.rs"), true)), None, "no plan yet");
-        assert_eq!(go(event("plan_exit", None, Some("Fix `src/a.rs`"), None, false)), None, "a forged plan");
-        assert_eq!(go(event("plan_exit", None, Some("Fix `src/a.rs`"), None, true)).as_deref(), Some("t"));
+        let mut b = Book::default();
+        let mut go = |e: AgentEvent| apply(&mut b, &e);
+        assert!(go(event("file_edited", None, None, Some("/w/shop/x.rs"), true)).is_empty(), "no plan yet");
+        assert!(go(event("plan_exit", None, Some("Fix `src/a.rs`"), None, false)).is_empty(), "a forged plan");
+        assert!(go(event("plan_exit", None, None, None, true)).is_empty(), "a plan without its text");
+        assert_eq!(go(event("plan_exit", None, Some("Fix `src/a.rs`"), None, true)), ["t"]);
         go(event("file_edited", None, None, Some("/w/shop/src/a.rs"), true));
         go(event("file_edited", Some("sub-1"), None, Some("/w/shop/package.json"), true));
-        assert_eq!(go(event("file_edited", None, None, Some("/w/shop/.env"), false)), None, "a forged edit");
-        let s = &scopes[&tabs["t"]];
+        assert!(go(event("file_edited", None, None, Some("/w/shop/.env"), false)).is_empty(), "a forged edit");
+        let s = b.get("t").unwrap();
         assert_eq!(s.row(), Some(("1 outside plan".into(), "package.json".into())), "the subagent works on its session's plan");
         assert!(matches!(decoration(s).unwrap().label_tone, Tone::Warn));
+        assert_eq!(b.scopes.len(), 1, "no scope for the forged or empty plans");
+    }
+
+    #[test]
+    fn a_new_session_in_a_tab_drops_the_old_ones_and_old_scopes_go() {
+        let mut b = Book::default();
+        apply(&mut b, &event("plan_exit", None, Some("`a.rs`"), None, true));
+        apply(&mut b, &event("plan_exit", Some("sub"), Some("`b.rs`"), None, true));
+        let mut next = event("plan_exit", None, Some("`c.rs`"), None, true);
+        next.session_id = Some("s2".into());
+        apply(&mut b, &next);
+        assert_eq!(b.scopes.keys().map(|k| k.0.as_str()).collect::<Vec<_>>(), ["s2"]);
+        for i in 0..SCOPES + 5 {
+            let mut e = event("plan_exit", None, Some("`a.rs`"), None, true);
+            (e.session_id, e.surface) = (Some(format!("x{i}")), Some(format!("t{i}")));
+            let redraw = apply(&mut b, &e);
+            assert_eq!(redraw.len(), if i >= SCOPES - 1 { 2 } else { 1 }, "the evicted tab is cleared too");
+        }
+        assert_eq!((b.scopes.len(), b.tabs.len()), (SCOPES, SCOPES));
+        assert!(b.get("t").is_none() && b.get(&format!("t{}", SCOPES + 4)).is_some(), "the oldest went");
+    }
+
+    #[test]
+    fn a_long_panel_is_cut_with_the_outside_files_first() {
+        let mut s = Scope::default();
+        let names: String = (1..scope::MAX).map(|i| format!("`lib/f{i}.rs` ")).collect();
+        let names = format!("`src/` {names}");
+        s.planned("/w", &names);
+        for i in 0..scope::MAX + 3 {
+            s.touch(&format!("/w/src/f{i}.rs"));
+        }
+        s.touch("/w/x.rs");
+        let n = nodes(&s);
+        assert!(n.len() < 512, "{}", n.len());
+        let labels: Vec<String> = n.iter().filter_map(|n| if let Node::Row(r) = &n.node { Some(r.label.clone()) } else { None }).collect();
+        assert!(labels.contains(&"+56 more".to_owned()) && labels.contains(&"x.rs".to_owned()) && labels.last().unwrap() == "more not counted", "{:?}", &labels[labels.len() - 3..]);
     }
 
     #[test]

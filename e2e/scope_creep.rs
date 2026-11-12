@@ -156,3 +156,62 @@ fn edits_outside_the_plan_mark_the_row() {
     drop(core);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn a_huge_plan_or_a_hostile_file_name_doesnt_blind_it() {
+    let dir = repo();
+    if !dir.join("haunt-plugin.toml").is_file() {
+        eprintln!("skipped: haunt-scope-creep not found; set HAUNT_PLUGINS_DIR");
+        return;
+    }
+    let tmp = PathBuf::from(format!("/tmp/haunt-fp-scope-big-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let (home, project) = (tmp.join("home"), tmp.join("shop"));
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["build", "--release", "--target", "wasm32-wasip2"])
+        .current_dir(&dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let o = Command::new(env!("CARGO_BIN_EXE_haunt")).args(["plugin", "install", dir.to_str().unwrap(), "--yes"]).env("HAUNT_HOME", &home).output().unwrap();
+    assert!(o.status.success(), "{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+
+    let core = Core::new(&home);
+    core.start().unwrap();
+    let p = project.display().to_string();
+    let (env, other) = (core.register_surface(&p).unwrap(), core.register_surface(&p).unwrap());
+    let set = Store::open(&home).unwrap().load_all(&PluginHost::new().unwrap(), Some(&core.handle())).unwrap();
+    assert!(set.errors().is_empty(), "{:?}", set.errors());
+    let set = Arc::new(Mutex::new(set));
+    attach(&core, &set);
+    let decoration = |s: &str| core.snapshot().groups.iter().flat_map(|g| &g.rows).find(|r| r.surface_id == s).and_then(|r| r.decoration.clone());
+
+    // As big as a plan line gets in: 200 lines, every word a path, most of them repeats.
+    let line = |i: usize| -> String { (0..19).map(|j| format!("`src/m{}/f{j}.rs` ", i % 40)).collect() };
+    let huge: String = (0..200).map(line).collect::<Vec<_>>().join("\n");
+    let huge = plan(&huge);
+    // Room for the rest of the line under intake's 64 KiB.
+    assert!(huge.len() > 60_000 && huge.len() < 64 * 1024 - 512, "{}", huge.len());
+    let mut sock = UnixStream::connect(&env.socket_path).unwrap();
+    send(&mut sock, &env, true, &p, &huge);
+    send(&mut sock, &env, true, &p, &edit("Edit", &project.join("src/m1/f1.rs")));
+    send(&mut sock, &env, true, &p, &edit("Write", &project.join("needs you/x.rs")));
+    send(&mut sock, &env, true, &p, &edit("Write", &project.join("notes.md")));
+    until("the row", || decoration(&env.surface_id).and_then(|d| d.label).as_deref() == Some("2 outside plan"));
+    assert_eq!(decoration(&env.surface_id).unwrap().suffix.as_deref(), Some("1 file, notes.md"), "a status-like name is never sent");
+
+    let mut sock2 = UnixStream::connect(&other.socket_path).unwrap();
+    let mut send2 = |rest: &str| {
+        let line = format!(r#"{{"v":1,"agent":"claude","surface_id":"{}","nonce":"{}","session_id":"s2","cwd":"{p}",{rest}}}"#, other.surface_id, other.nonce);
+        sock2.write_all(format!("{line}\n").as_bytes()).unwrap();
+    };
+    send2(&plan("Fix `src/a.rs`."));
+    send2(&edit("Edit", &project.join("b.rs")));
+    until("the other tab", || decoration(&other.surface_id).and_then(|d| d.label).as_deref() == Some("1 outside plan"));
+
+    drop(core);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

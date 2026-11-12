@@ -1,36 +1,59 @@
 //! What a plan names, and whether a file an agent touched falls inside it. Free of host calls.
 
+use std::collections::HashSet;
+
 /// A file or folder a plan names, as written there (relative to the repo or the agent's folder).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Named {
     pub path: String,
     pub folder: bool,
 }
 
+/// Plan entries, task paths, and inside and outside touches, each: a runaway agent can't grow the
+/// plugin's memory or its per-event work without end.
+pub const MAX: usize = 256;
+
 /// Words with a slash that are prose, not paths.
 const PROSE: [&str; 12] = ["and/or", "either/or", "input/output", "read/write", "client/server", "true/false", "yes/no", "on/off", "i/o", "n/a", "w/o", "pass/fail"];
 
-/// The paths and folders `text` names: backticked names, words with a `/`, and words with a file
-/// extension. URLs, absolute paths outside `cwd`, `~`, `..`, globs and Windows paths are left out.
+/// Files named without an extension.
+const BARE: [&str; 6] = ["Makefile", "Dockerfile", "Gemfile", "Pipfile", "Procfile", "LICENSE"];
+
+/// Folders above the agent's a plan's paths may be relative to (the repo root, usually one or two up).
+const UP: usize = 8;
+
+/// The paths and folders `text` names: backticked names, Markdown link targets, words with a `/`,
+/// words with a file extension and known extensionless files. A backticked span of one word counts
+/// whatever it is. URLs, absolute paths outside `cwd`, `~`, `..`, globs and Windows paths are left
+/// out. At most `MAX`.
 pub fn extract(text: &str, cwd: &str) -> Vec<Named> {
     let mut out: Vec<Named> = Vec::new();
+    let mut seen: HashSet<Named> = HashSet::new();
     for (i, span) in text.split('`').enumerate() {
         let code = i % 2 == 1;
+        let lone = code && span.split_whitespace().nth(1).is_none();
         for word in span.split_whitespace() {
-            if let Some(n) = named(word, cwd, code)
-                && !out.contains(&n)
-            {
-                out.push(n);
+            for (k, piece) in word.split("](").enumerate() {
+                // `[text](path#anchor)`
+                let piece = if k > 0 { piece.split('#').next().unwrap_or(piece) } else { piece };
+                if let Some(n) = named(piece, cwd, code, lone)
+                    && seen.insert(n.clone())
+                {
+                    out.push(n);
+                    if out.len() == MAX {
+                        return out;
+                    }
+                }
             }
         }
     }
     out
 }
 
-fn named(word: &str, cwd: &str, code: bool) -> Option<Named> {
+fn named(word: &str, cwd: &str, code: bool, lone: bool) -> Option<Named> {
     let punct = |c: char| ",;:!?()[]{}\"'*<>".contains(c);
     let w = word.trim_start_matches(punct).trim_end_matches(|c| punct(c) || c == '.');
-    if w.is_empty() || w.contains("://") || w.contains('\\') || w.starts_with('~') || w.contains(['$', '*', '{', '}', '|', '=', '@', '#']) {
+    if w.is_empty() || w.contains("://") || w.contains('\\') || w.starts_with(['~', '-']) || w.contains(['$', '*', '{', '}', '|', '=', '@', '#']) {
         return None;
     }
     if w.len() > 2 && w.as_bytes()[1] == b':' {
@@ -49,12 +72,12 @@ fn named(word: &str, cwd: &str, code: bool) -> Option<Named> {
         return None;
     }
     let last = path.rsplit('/').next().unwrap_or(path);
-    let file = has_extension(last);
+    let file = has_extension(last) || BARE.contains(&last);
     match (folder, path.contains('/'), file) {
         (true, _, _) => Some(Named { path: path.into(), folder: true }),
         (false, _, true) => Some(Named { path: path.into(), folder: false }),
         (false, true, false) => Some(Named { path: path.into(), folder: true }),
-        (false, false, false) => None,
+        (false, false, false) => lone.then(|| Named { path: path.into(), folder: false }),
     }
 }
 
@@ -87,10 +110,11 @@ fn locks(manifest: &str) -> &'static [&'static str] {
     }
 }
 
-/// Per plan, so a runaway agent can't grow the plugin's memory without end.
-const MAX: usize = 256;
-
 const TEST_DIRS: [&str; 4] = ["test", "tests", "__tests__", "spec"];
+
+fn in_test_dir(dir: &str) -> bool {
+    dir.split('/').any(|s| TEST_DIRS.contains(&s))
+}
 
 /// `foo.test.js`, `foo.spec.ts`, `foo_test.go`, `test_foo.py` -> `foo.js`, `foo.ts`, `foo.go`, `foo.py`.
 fn untested(name: &str) -> String {
@@ -103,87 +127,194 @@ fn split(path: &str) -> (&str, &str) {
     path.rsplit_once('/').unwrap_or(("", path))
 }
 
-/// `dir` (absolute) is `named` (a plan's relative folder), or ends in it.
-fn dir_is(dir: &str, named: &str) -> bool {
-    named.is_empty() || dir == named || dir.ends_with(&format!("/{named}"))
+/// `path` with `.`, `..` and empty segments resolved; None unless absolute and staying under `/`.
+pub fn normal(path: &str) -> Option<String> {
+    let mut segs: Vec<&str> = Vec::new();
+    for s in path.strip_prefix('/')?.split('/') {
+        match s {
+            "" | "." => {}
+            ".." => {
+                segs.pop()?;
+            }
+            s => segs.push(s),
+        }
+    }
+    Some(format!("/{}", segs.join("/")))
 }
 
-/// Whether `path` (absolute, as the file event gave it) is inside what `plan` names.
-pub fn inside(path: &str, cwd: &str, plan: &[Named]) -> bool {
-    let rel = path.strip_prefix(cwd.trim_end_matches('/')).and_then(|r| r.strip_prefix('/'));
-    let (dir, name) = split(path);
-    plan.iter().any(|n| {
-        if n.folder {
-            return rel.is_some_and(|r| r.starts_with(&format!("{}/", n.path))) || path.contains(&format!("/{}/", n.path));
+/// `path` relative to `cwd`, when strictly under it.
+fn rel_of<'a>(path: &'a str, cwd: &str) -> Option<&'a str> {
+    path.strip_prefix(cwd.trim_end_matches('/'))?.strip_prefix('/').filter(|r| !r.is_empty())
+}
+
+/// `/Users/me/x` as `~/x`.
+fn tilde(path: &str) -> String {
+    for home in ["/Users/", "/home/"] {
+        if let Some(rest) = path.strip_prefix(home) {
+            return match rest.split_once('/') {
+                Some((_, r)) => format!("~/{r}"),
+                None => "~".into(),
+            };
         }
-        if rel == Some(n.path.as_str()) || path.ends_with(&format!("/{}", n.path)) {
+    }
+    path.into()
+}
+
+/// One named path, split up once per plan so a touch compares without building strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    named: Named,
+    dir: String,
+    name: String,
+    untested: String,
+    in_tests: bool,
+}
+
+pub fn rules(named: &[Named]) -> Vec<Rule> {
+    named
+        .iter()
+        .map(|n| {
+            let (dir, name) = split(&n.path);
+            Rule { named: n.clone(), dir: dir.into(), name: name.into(), untested: untested(name), in_tests: in_test_dir(dir) }
+        })
+        .collect()
+}
+
+/// Whether `path` (absolute and `normal`) is inside what `plan` names. Only a file under the agent's
+/// folder can be; the plan's paths are read from there or from a folder above it.
+pub fn inside(path: &str, cwd: &str, plan: &[Rule]) -> bool {
+    let Some(rel) = rel_of(path, cwd) else { return false };
+    // `src/a.rs`, then `web/src/a.rs`, … as seen from each folder above.
+    let mut seen = vec![rel.to_owned()];
+    let mut tail = String::new();
+    for seg in cwd.trim_end_matches('/').rsplit('/').filter(|s| !s.is_empty()).take(UP) {
+        tail = format!("{seg}/{tail}");
+        seen.push(format!("{tail}{rel}"));
+    }
+    let (rdir, name) = split(rel);
+    let (base, tests) = (untested(name), in_test_dir(rdir));
+    plan.iter().any(|r| {
+        let n = &r.named;
+        if n.folder {
+            return seen.iter().any(|c| c.strip_prefix(n.path.as_str()).is_some_and(|rest| rest.starts_with('/')));
+        }
+        if seen.contains(&n.path) {
             return true;
         }
-        let (ndir, nname) = split(&n.path);
-        let at_root = rel.is_some_and(|r| !r.contains('/'));
-        let near = if ndir.is_empty() { at_root } else { dir_is(dir, ndir) };
-        let test_dir = |d: &str| d.split('/').any(|s| TEST_DIRS.contains(&s));
-        let sibling = name != nname && untested(name) == untested(nname) && (dir_is(dir, ndir) || test_dir(dir) || test_dir(ndir));
-        sibling || locks(nname).contains(&name) && (near || at_root)
+        let same_dir = || seen.iter().any(|c| split(c).0 == r.dir);
+        if name != r.name && base == r.untested && (tests || r.in_tests || same_dir()) {
+            return true;
+        }
+        locks(&r.name).contains(&name) && (!rel.contains('/') || same_dir())
     })
 }
 
-/// How an outside file shows on the row: its top folder (`.github/`) unless the plan names
-/// something under that folder, else its path.
-pub fn short(rel: &str, plan: &[Named]) -> String {
-    match rel.split_once('/') {
-        Some((top, _)) if !plan.iter().any(|n| n.path == top || n.path.starts_with(&format!("{top}/"))) => format!("{top}/"),
-        _ => rel.into(),
+/// Whether a suffix would read as a row needing you: a looser copy of Haunt's own check, so Haunt
+/// never refuses what passes here. Anything non-ASCII counts, as Haunt reads it as a wildcard.
+pub fn says_needs_you(text: &str) -> bool {
+    if !text.is_ascii() {
+        return true;
     }
+    let mut flat: Vec<u8> = Vec::new();
+    for c in text.bytes().map(|c| c.to_ascii_lowercase()) {
+        let c = match c {
+            b'0' => b'o',
+            b'1' | b'i' | b'|' => b'l',
+            b'5' => b's',
+            c if c.is_ascii_alphanumeric() => c,
+            _ => continue,
+        };
+        if c == b'v' && flat.last() == Some(&b'v') {
+            *flat.last_mut().unwrap() = b'w';
+        } else {
+            flat.push(c);
+        }
+    }
+    [&b"needsyou"[..], b"waltlngforyou"].iter().any(|p| flat.windows(p.len()).any(|w| w == *p))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Touch {
-    /// As the event gave it.
+    /// Normalised when absolute.
     pub path: String,
-    /// Relative to the agent's folder when inside it.
+    /// Relative to the agent's folder when under it, else the full path with `~` for home.
     pub shown: String,
+    pub local: bool,
     pub inside: bool,
 }
 
 /// One agent's plan and what it touched since.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Scope {
     pub cwd: String,
     pub plan: Vec<Named>,
     /// Paths its task subjects named, kept across plans.
     pub tasks: Vec<Named>,
+    named: Vec<Named>,
+    rules: Vec<Rule>,
+    seen: HashSet<String>,
     pub touched: Vec<Touch>,
+    pub inside_n: usize,
+    pub outside_n: usize,
+    /// More touches came than `MAX` of their kind.
+    pub inside_full: bool,
+    pub outside_full: bool,
 }
 
 impl Scope {
     /// A new plan replaces the old one and starts the touches over.
     pub fn planned(&mut self, cwd: &str, plan: &str) {
-        self.cwd = cwd.into();
-        self.plan = extract(plan, cwd);
+        self.cwd = normal(cwd).unwrap_or_else(|| cwd.into());
+        self.plan = extract(plan, &self.cwd);
+        self.seen.clear();
         self.touched.clear();
+        (self.inside_n, self.outside_n, self.inside_full, self.outside_full) = (0, 0, false, false);
+        self.renamed();
     }
 
     pub fn tasked(&mut self, cwd: &str, subject: &str) {
-        for n in extract(subject, cwd) {
-            if self.tasks.len() < MAX && !self.tasks.contains(&n) {
-                self.tasks.push(n);
-            }
+        let known: HashSet<Named> = self.tasks.iter().cloned().collect();
+        let new: Vec<Named> = extract(subject, cwd).into_iter().filter(|n| !known.contains(n)).collect();
+        if new.is_empty() || self.tasks.len() >= MAX {
+            return;
         }
+        self.tasks.extend(new.into_iter().take(MAX - self.tasks.len()));
+        self.renamed();
     }
 
-    pub fn named(&self) -> Vec<Named> {
-        self.plan.iter().chain(self.tasks.iter().filter(|t| !self.plan.contains(t))).cloned().collect()
+    fn renamed(&mut self) {
+        let mut seen: HashSet<&Named> = HashSet::new();
+        self.named = self.plan.iter().chain(&self.tasks).filter(|n| seen.insert(n)).cloned().collect();
+        self.rules = rules(&self.named);
     }
 
-    /// Records a touch; true when it is new.
-    pub fn touch(&mut self, path: &str) -> bool {
-        if self.plan.is_empty() || self.touched.len() >= MAX || self.touched.iter().any(|t| t.path == path) {
+    /// The plan's paths, then the tasks' it doesn't have.
+    pub fn named(&self) -> &[Named] {
+        &self.named
+    }
+
+    /// Records a touch; true when the row or panel changes.
+    pub fn touch(&mut self, raw: &str) -> bool {
+        if self.plan.is_empty() {
             return false;
         }
-        let shown = path.strip_prefix(self.cwd.trim_end_matches('/')).and_then(|r| r.strip_prefix('/')).unwrap_or(path).to_owned();
-        let inside = inside(path, &self.cwd, &self.named());
-        self.touched.push(Touch { path: path.into(), shown, inside });
+        let path = normal(raw).unwrap_or_else(|| raw.into());
+        if self.seen.contains(&path) {
+            return false;
+        }
+        let inside = inside(&path, &self.cwd, &self.rules);
+        let (n, full) = if inside { (&mut self.inside_n, &mut self.inside_full) } else { (&mut self.outside_n, &mut self.outside_full) };
+        if *n >= MAX {
+            return !std::mem::replace(full, true);
+        }
+        *n += 1;
+        let rel = rel_of(&path, &self.cwd).map(str::to_owned);
+        let (shown, local) = match rel {
+            Some(r) => (r, true),
+            None => (tilde(&path), false),
+        };
+        self.seen.insert(path.clone());
+        self.touched.push(Touch { path, shown, local, inside });
         true
     }
 
@@ -193,28 +324,40 @@ impl Scope {
 
     /// The row: `2 outside plan` and `package.json, .github/`; nothing while all is inside.
     pub fn row(&self) -> Option<(String, String)> {
-        let n = self.outside().count();
-        if n == 0 {
+        if self.outside_n == 0 {
             return None;
         }
-        let named = self.named();
-        let mut short: Vec<String> = Vec::new();
+        let label = if self.outside_full { format!("{MAX}+ outside plan") } else { format!("{} outside plan", self.outside_n) };
+        let mut listed: HashSet<String> = HashSet::new();
+        let mut suffix = String::new();
         for t in self.outside() {
-            let s = short_of(&t.shown, &named);
-            if !short.contains(&s) {
-                short.push(s);
+            // Haunt shows 64 characters.
+            if suffix.len() >= 64 {
+                break;
+            }
+            let s = if t.local { short(&t.shown, &self.named) } else { t.shown.clone() };
+            if !listed.insert(s.clone()) {
+                continue;
+            }
+            for item in [s.as_str(), "1 file"] {
+                let next = if suffix.is_empty() { item.to_owned() } else { format!("{suffix}, {item}") };
+                if !says_needs_you(&next) {
+                    suffix = next;
+                    break;
+                }
             }
         }
-        Some((format!("{n} outside plan"), short.join(", ")))
+        Some((label, suffix))
     }
 }
 
-fn short_of(shown: &str, plan: &[Named]) -> String {
-    if shown.starts_with('/') {
-        // Outside the agent's folder: just the name.
-        return shown.rsplit('/').next().unwrap_or(shown).into();
+/// How an outside file shows on the row: its top folder (`.github/`) unless the plan names
+/// something under that folder, else its path.
+pub fn short(rel: &str, plan: &[Named]) -> String {
+    match rel.split_once('/') {
+        Some((top, _)) if !plan.iter().any(|n| n.path == top || n.path.strip_prefix(top).is_some_and(|r| r.starts_with('/'))) => format!("{top}/"),
+        _ => rel.into(),
     }
-    short(shown, plan)
 }
 
 #[cfg(test)]
@@ -228,10 +371,11 @@ middleware in src/middleware/session.ts, e.g. by retrying once.\n\
 \n\
 1. Update `src/auth/` to keep the old token for 5 s (see docs/auth.md).\n\
 2. Add a test next to the client: `src/api/client.ts`.\n\
-3. Bump `package.json` for jose 5.2.\n\
+3. Bump `package.json` for jose 5.2, per [the notes](docs/jose.md#upgrade).\n\
+4. Wire it into the Makefile and `scripts/ci`.\n\
 - Don't touch ../shared/config.ts or C:\\Users\\me\\x.ts or ~/notes.md.\n\
 - Read https://example.com/rfc.html and /etc/hosts and/or the Node.js docs, i.e. nothing else.\n\
-- Run `npm test` and `cargo test -p core`.";
+- Run `npm test`, `cargo test -p core` and `--force` never.";
 
     fn paths(n: &[Named]) -> Vec<String> {
         n.iter().map(|n| if n.folder { format!("{}/", n.path) } else { n.path.clone() }).collect()
@@ -242,7 +386,18 @@ middleware in src/middleware/session.ts, e.g. by retrying once.\n\
         let n = extract(PLAN, "/w/shop");
         assert_eq!(
             paths(&n),
-            ["src/auth/refresh.ts", "src/middleware/session.ts", "src/auth/", "docs/auth.md", "src/api/client.ts", "package.json", "Node.js"],
+            [
+                "src/auth/refresh.ts",
+                "src/middleware/session.ts",
+                "src/auth/",
+                "docs/auth.md",
+                "src/api/client.ts",
+                "package.json",
+                "docs/jose.md",
+                "Makefile",
+                "scripts/ci/",
+                "Node.js"
+            ],
         );
     }
 
@@ -253,33 +408,71 @@ middleware in src/middleware/session.ts, e.g. by retrying once.\n\
         assert!(extract("version 1.2.3, v2, e.g. this", "/w").is_empty());
     }
 
+    #[test]
+    fn a_lone_backticked_word_or_a_known_file_is_named() {
+        assert_eq!(paths(&extract("Edit `Justfile`, docker/Dockerfile and LICENSE, not `make all` or Justfile", "/w")), ["Justfile", "docker/Dockerfile", "LICENSE"]);
+    }
+
+    #[test]
+    fn a_plan_names_at_most_max_paths() {
+        let text: String = (0..MAX * 4).map(|i| format!("`src/f{i}.rs` `src/f{i}.rs` ")).collect();
+        let n = extract(&text, "/w");
+        assert_eq!((n.len(), n[MAX - 1].path.as_str()), (MAX, format!("src/f{}.rs", MAX - 1).as_str()));
+    }
+
     fn plan(text: &str) -> Scope {
         let mut s = Scope::default();
         s.planned("/w/shop", text);
         s
     }
 
+    fn at(s: &Scope, p: &str) -> bool {
+        inside(&format!("/w/shop/{p}"), "/w/shop", &s.rules)
+    }
+
     #[test]
     fn named_files_folders_and_suffixes_are_inside() {
         let s = plan(PLAN);
-        let named = s.named();
-        let at = |p: &str| inside(&format!("/w/shop/{p}"), "/w/shop", &named);
-        assert!(at("src/auth/refresh.ts") && at("src/auth/token.ts") && at("src/auth/deep/x.ts"));
-        assert!(at("package.json") && at("docs/auth.md"));
-        assert!(!at("src/billing/x.ts") && !at(".github/workflows/ci.yml") && !at("docs/other.md"));
-        assert!(inside("/w/shop/web/src/api/client.ts", "/w/shop/web", &named), "names relative to the repo root match from a subfolder");
+        assert!(at(&s, "src/auth/refresh.ts") && at(&s, "src/auth/token.ts") && at(&s, "src/auth/deep/x.ts"));
+        assert!(at(&s, "package.json") && at(&s, "docs/auth.md") && at(&s, "Makefile"));
+        assert!(!at(&s, "src/billing/x.ts") && !at(&s, ".github/workflows/ci.yml") && !at(&s, "docs/other.md"));
+        let web = rules(&extract("`web/src/api/client.ts`", "/w/shop/web"));
+        assert!(inside("/w/shop/web/src/api/client.ts", "/w/shop/web", &web), "names relative to the repo root match from a subfolder");
+    }
+
+    #[test]
+    fn nothing_outside_the_agents_folder_is_inside() {
+        let s = plan("`src/auth/` `src/auth/refresh.ts` `x.ts` `package.json`");
+        let out = |p: &str| !inside(p, "/w/shop", &s.rules);
+        assert!(out("/w/other/src/auth/refresh.ts"), "same tail, another repo");
+        assert!(out("/w/other/src/auth/token.ts"), "a folder of the same name elsewhere");
+        assert!(out("/w/tests/x.test.ts"), "a test folder above the agent's");
+        assert!(out("/w/shop/src/x.test.ts"), "a root file's test is next to it or in a test folder, not anywhere");
+        assert!(out("/w/shop/deep/x.ts") && out("/w/shop/deep/package-lock.json"), "a root file is at the root");
+        assert!(!out("/w/shop/x.test.ts") && !out("/w/shop/tests/x.test.ts") && !out("/w/shop/package-lock.json"));
+    }
+
+    #[test]
+    fn dot_segments_resolve_before_matching() {
+        let mut s = plan("`src/auth/`");
+        assert_eq!(normal("/w/shop/src/auth/../../../other/src/auth/x.ts").as_deref(), Some("/w/other/src/auth/x.ts"));
+        assert_eq!(normal("/../x"), None);
+        s.touch("/w/shop/src/auth/./x.ts");
+        s.touch("/w/shop/src/auth/../../../other/src/auth/y.ts");
+        s.touch("/w/shop/src//auth/x.ts");
+        assert_eq!(s.row(), Some(("1 outside plan".into(), "/w/other/src/auth/y.ts".into())), "once each, by where it lands");
     }
 
     #[test]
     fn test_siblings_and_lockfiles_follow_what_the_plan_names() {
-        let named = extract("`src/api/client.ts`, `lib/parse.py`, `package.json`, `crates/core/Cargo.toml`", "/w");
+        let named = rules(&extract("`src/api/client.ts`, `lib/parse.py`, `package.json`, `crates/core/Cargo.toml`", "/w"));
         let at = |p: &str| inside(&format!("/w/{p}"), "/w", &named);
         assert!(at("src/api/client.test.ts") && at("src/api/client.spec.ts") && at("test/client.test.ts") && at("src/api/__tests__/client.test.ts"));
         assert!(at("lib/test_parse.py") && at("tests/test_parse.py"));
         assert!(!at("src/other/client.test.ts"), "a test of another client is not a sibling");
         assert!(at("package-lock.json") && at("yarn.lock") && at("crates/core/Cargo.lock") && at("Cargo.lock"), "the workspace lock sits at the root");
         assert!(!at("src/package-lock.json") && !at("Gemfile.lock"));
-        let tests = extract("`src/foo.test.js`", "/w");
+        let tests = rules(&extract("`src/foo.test.js`", "/w"));
         assert!(inside("/w/src/foo.js", "/w", &tests), "and the other way round");
     }
 
@@ -298,10 +491,39 @@ middleware in src/middleware/session.ts, e.g. by retrying once.\n\
     #[test]
     fn the_row_groups_outside_files_by_top_folder() {
         let mut s = plan("Fix `src/auth/refresh.ts`.");
-        for p in ["src/auth/refresh.ts", "package.json", ".github/workflows/ci.yml", ".github/dependabot.yml", "src/billing/x.ts", "/w/other/notes.md"] {
+        for p in ["src/auth/refresh.ts", "package.json", ".github/workflows/ci.yml", ".github/dependabot.yml", "src/billing/x.ts", "/Users/me/notes.md"] {
             s.touch(&format!("{}{p}", if p.starts_with('/') { "" } else { "/w/shop/" }));
         }
-        assert_eq!(s.row(), Some(("5 outside plan".into(), "package.json, .github/, src/billing/x.ts, notes.md".into())));
+        assert_eq!(s.row(), Some(("5 outside plan".into(), "package.json, .github/, src/billing/x.ts, ~/notes.md".into())));
+    }
+
+    #[test]
+    fn inside_edits_cant_crowd_out_outside_ones() {
+        let mut s = plan("`src/`");
+        for i in 0..MAX + 10 {
+            s.touch(&format!("/w/shop/src/f{i}.rs"));
+        }
+        assert!(s.touch("/w/shop/x.rs"), "still counted");
+        assert_eq!((s.inside_n, s.inside_full, s.row().unwrap().0), (MAX, true, "1 outside plan".into()));
+        let mut changed = 0;
+        for i in 0..MAX + 10 {
+            changed += s.touch(&format!("/w/shop/o{i}.rs")) as usize;
+        }
+        assert_eq!((s.row().unwrap().0, changed), (format!("{MAX}+ outside plan"), MAX), "MAX - 1 more, then one change to say so");
+    }
+
+    #[test]
+    fn a_file_named_like_a_status_never_reaches_the_row() {
+        assert!(says_needs_you("needs you/x.rs") && says_needs_you("NEEDS_Y0U") && says_needs_you("needs, you.rs") && says_needs_you("vvaiting-for-you"));
+        assert!(says_needs_you("café.md"), "non-ASCII could be a lookalike");
+        assert!(!says_needs_you("package.json, .github/") && !says_needs_you("1 file"));
+        let mut s = plan("`src/`");
+        for p in ["needs you/x.rs", "a.rs", "needs", "you.rs"] {
+            s.touch(&format!("/w/shop/{p}"));
+        }
+        let (label, suffix) = s.row().unwrap();
+        assert_eq!((label.as_str(), suffix.as_str()), ("4 outside plan", "1 file, a.rs, needs, 1 file"));
+        assert!(!says_needs_you(&suffix));
     }
 
     #[test]
@@ -312,5 +534,9 @@ middleware in src/middleware/session.ts, e.g. by retrying once.\n\
         s.planned("/w/shop", "Fix `src/a.rs`.");
         s.touch("/w/shop/README.md");
         assert_eq!(s.row(), None);
+        for i in 0..MAX * 2 {
+            s.tasked("/w/shop", &format!("Write `t{i}.md`"));
+        }
+        assert_eq!(s.tasks.len(), MAX);
     }
 }
