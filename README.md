@@ -21,7 +21,7 @@ An edit is inside the plan only when it lands in the agent's folder (after resol
 
 An edit outside the agent's folder always counts as outside, shown by its full path (`~/notes.md`). The row lists whole names, as many as fit in Haunt's 64 characters; a name that reads like a Haunt status, or one too long for the row, shows as `1 file`. After 256 outside edits the row reads `256+ outside plan`.
 
-A new plan replaces the old one, and the count starts over. When a tab starts a new session, the old session's plans go. Memory is bounded across all agents: 64 plans (32 of them task-only), 4,096 touched files and 64 KB of plan paths in total, each path cut to 256 bytes. Past that it drops task-only scopes first, then plans no tab is showing, oldest first. Each subagent with its own plan is checked against that plan. A subagent without one is checked against its session's plan.
+A new plan replaces the old one, and the count starts over. When a tab starts a new session, the old session's plans go. Memory is bounded across all agents: 64 plans (32 of them task-only), 4,096 touched files and 64 KB of plan paths in total, each path cut to 256 bytes. One plan keeps at most 16 KB of paths, and its tasks 8 KB. Past the totals it drops task-only scopes, then plans no tab is showing, oldest first; a plan a tab shows, or its session's own plan behind a subagent's, goes only past the 64-plan count. Each subagent with its own plan is checked against that plan. A subagent without one is checked against its session's plan.
 
 ## What it can't see
 
