@@ -19,9 +19,9 @@ An edit is inside the plan only when it lands in the agent's folder (after resol
 - a test next to a named file: `foo.js` covers `foo.test.js`, `foo.spec.js`, `foo_test.go`, `test_foo.py`, and the same name under `test/`, `tests/`, `__tests__/` or `spec/`;
 - the lockfile of a named manifest: `package.json` covers `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` and `bun.lock`, and `Cargo.toml` covers `Cargo.lock`. The same goes for `pyproject.toml`, `Pipfile`, `Gemfile`, `go.mod`, `composer.json` and `mix.exs`.
 
-An edit outside the agent's folder always counts as outside, shown by its full path (`~/notes.md`). The row lists as many as fit in Haunt's 64 characters; a name that reads like a Haunt status shows as `1 file`. After 256 outside edits the row reads `256+ outside plan`.
+An edit outside the agent's folder always counts as outside, shown by its full path (`~/notes.md`). The row lists whole names, as many as fit in Haunt's 64 characters; a name that reads like a Haunt status, or one too long for the row, shows as `1 file`. After 256 outside edits the row reads `256+ outside plan`.
 
-A new plan replaces the old one, and the count starts over. When a tab starts a new session, the old session's plans go. It keeps the 64 most recently active plans. Each subagent with its own plan is checked against that plan. A subagent without one is checked against its session's plan.
+A new plan replaces the old one, and the count starts over. When a tab starts a new session, the old session's plans go. Memory is bounded across all agents: 64 plans (32 of them task-only), 4,096 touched files and 64 KB of plan paths in total, each path cut to 256 bytes. Past that it drops task-only scopes first, then plans no tab is showing, oldest first. Each subagent with its own plan is checked against that plan. A subagent without one is checked against its session's plan.
 
 ## What it can't see
 
