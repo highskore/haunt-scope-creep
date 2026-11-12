@@ -1,0 +1,19 @@
+[plugin]
+id = "dev.haunt.scope-creep"
+name = "Scope creep"
+description = "Marks an agent's row when it edits files its own plan didn't name"
+version = "0.1.0"
+api = "0.5"
+entry = "target/wasm32-wasip2/release/haunt_plugin.wasm"
+license = "MIT"
+
+[capabilities]
+# The plan (plan exit), task subjects and the files agents edit; nothing else is read.
+events = ["agent.plan-exit", "agent.task", "agent.file-edited"]
+# The plan's text and the edited file's path.
+event_details = true
+decorate = true
+panel = true
+
+[settings]
+row = { type = "bool", default = true, description = "Mark the agent's row with \"2 outside plan\" and the files" }
